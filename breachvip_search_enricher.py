@@ -1,104 +1,125 @@
 #!/usr/bin/env python3
-# plugins/enrichers/breachvip_search_enricher.py
+# plugins/enrichers/breachvip_search_flowsint.py
 
 """
-FlowSINT Enricher – Breach.VIP Search 
+FlowsInt Enricher – BreachVIP Search
+------------------------------------
+This script is a FlowsInt‑specific implementation that follows the
+documentation at https://www.flowsint.io/docs/developers/managing-enrichers.
 """
 
-import os, sys, json, time
-import requests
+import os
+import json
+import time
+from typing import Dict, Any
+
+import httpx
+from flowsint.enrich import enrich  # <-- FlowsInt decorator
 
 # ------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------
-BASE_URL      = "https://breach.vip"
-SEARCH_PATH   = "/api/search"
-MAX_RETRIES   = 3
-RETRY_DELAY   = 2          
-RATE_LIMIT    = 15        
-MIN_INTERVAL  = 60 / RATE_LIMIT
+BASE_URL        = "https://breach.vip"
+SEARCH_ENDPOINT = "/api/search"
+
+RATE_LIMIT      = 15            
+MIN_INTERVAL    = 60 / RATE_LIMIT
+
+# Simple in‑memory counter – FlowsInt runs a single process per worker
+_last_request_ts = 0.0
 
 # ------------------------------------------------------------------
-def safe_json(text: str):
-    try:
-        return json.loads(text)
-    except Exception as exc:
-        return {"error": f"JSON parse error: {exc}"}
+def _rate_limit_sleep() -> None:
+    """
+    Sleep if we are hitting the 15‑req/min limit.
+    This is a *very* simple implementation – in production you might
+    want to use a token bucket or Redis‑backed counter.
+    """
+    global _last_request_ts
+    now = time.time()
+    if now - _last_request_ts < MIN_INTERVAL:
+        sleep_for = MIN_INTERVAL - (now - _last_request_ts)
+        time.sleep(sleep_for)
+    _last_request_ts = time.time()
 
 # ------------------------------------------------------------------
-def post_search(payload: dict) -> dict:
+def _build_payload(item: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Calls /api/search with the supplied payload.
-    Retries on 429 (rate‑limit) with exponential back‑off.
+    Convert the incoming FlowsInt item into a SearchRequest
+    that matches the OpenAPI spec.
     """
-    url = f"{BASE_URL}{SEARCH_PATH}"
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=15)
-            if resp.status_code == 429:
-                # Too many requests – wait and retry
-                time.sleep(RETRY_DELAY * attempt)
-                continue
-
-            resp.raise_for_status()
-            return safe_json(resp.text)
-
-        except requests.exceptions.RequestException as exc:
-            if attempt == MAX_RETRIES:
-                return {"error": f"HTTP error after {MAX_RETRIES} attempts: {exc}"}
-            time.sleep(RETRY_DELAY * attempt)
-
-    return {"error": "unreachable code – should never happen"}
-
-# ------------------------------------------------------------------
-def enrich(item: dict) -> dict:
-    """
-    FlowSINT entry point.
-    Expected input:
-        {
-            "term":   "test@*.com",
-            "fields": ["email", "domain"],
-            "wildcard": True,          # optional
-            "case_sensitive": False    # optional
-        }
-    """
-    term   = item.get("term")
-    fields = item.get("fields")
-
-    if not term or not fields:
-        return {"error": "Both 'term' and 'fields' must be supplied"}
-
-    # Build the request body according to SearchRequest schema
     payload = {
-        "term":   term,
-        "fields": fields
+        "term":   item["term"],
+        "fields": item["fields"]
     }
-
-    # Optional properties – only include if present in the input
+    # Optional properties – only include if present
     for opt in ("categories", "wildcard", "case_sensitive"):
         if opt in item:
             payload[opt] = item[opt]
+    return payload
 
-    raw_resp = post_search(payload)
+# ------------------------------------------------------------------
+@enrich(name="BreachVIP Search")
+async def breachvip_search(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    FlowsInt entry point.
+    The function must be async and return a JSON‑serialisable dict.
+    """
+    # ------------------------------------------------------------------
+    # Validate input
+    if "term" not in item or "fields" not in item:
+        return {"error": "Both 'term' and 'fields' must be supplied"}
 
-    # If the API returned an error, forward it
-    if "error" in raw_resp:
-        return {"term": term, "fields": fields, "error": raw_resp["error"]}
+    # ------------------------------------------------------------------
+    _rate_limit_sleep()          # respect the 15‑req/min rule
 
-    # The API returns a SearchResponse with a list of Result objects
-    results = raw_resp.get("results", [])
+    payload = _build_payload(item)
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.post(
+                f"{BASE_URL}{SEARCH_ENDPOINT}",
+                json=payload,
+                headers={"Accept": "application/json"}
+            )
+        except httpx.RequestError as exc:
+            return {"error": f"Request failed: {exc}"}
+
+    # ------------------------------------------------------------------
+    if resp.status_code == 429:
+        return {"error": "Rate limited – try again later"}
+
+    if resp.status_code >= 400:
+        # Attempt to parse the error body
+        try:
+            err = resp.json()
+            return {"error": err.get("error", f"HTTP {resp.status_code}")}
+        except Exception:
+            return {"error": f"HTTP {resp.status_code}"}
+
+    # ------------------------------------------------------------------
+    # Successful response
+    try:
+        data = resp.json()
+    except Exception as exc:
+        return {"error": f"JSON parse error: {exc}"}
+
+    # The API returns a SearchResponse with a `results` array
     return {
-        "term":   term,
-        "fields": fields,
-        "results": results,
-        "timestamp_utc": json.dumps(time.time(), default=lambda x: x)
+        "term":   item["term"],
+        "fields": item["fields"],
+        "results": data.get("results", []),
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     }
 
 # ------------------------------------------------------------------
+# The following block allows the script to be run directly for debugging
 if __name__ == "__main__":
-    # FlowSINT passes a JSON object via stdin
+    import sys
+
+    # FlowsInt passes a JSON object via stdin
     input_item = json.load(sys.stdin)
-    output = enrich(input_item)
-    print(json.dumps(output))
+    # Run the async function synchronously for debugging
+    import asyncio
+    output = asyncio.run(breachvip_search(input_item))
+    print(json.dumps(output, indent=2))
